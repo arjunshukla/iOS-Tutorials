@@ -390,8 +390,187 @@ Implement a **cache stampede prevention** test:
 
 ---
 
+## MVVM Integration: `send(_:)` ViewModel wrapper
+
+```swift
+// ImageViewModel.swift — wraps ImageCache in the standard send pattern
+import Observation
+import SwiftUI
+
+enum ImageAction: Sendable {
+    case load(url: URL)
+    case cancel
+    case invalidate(url: URL)
+}
+
+struct ImageState: Equatable {
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case loaded(Image)
+        case failed(String)
+    }
+    var phase: Phase = .idle
+
+    // ★ Image is not Equatable by default — wrap in identifier
+    static func == (lhs: ImageState, rhs: ImageState) -> Bool {
+        switch (lhs.phase, rhs.phase) {
+        case (.idle, .idle), (.loading, .loading): return true
+        case (.failed(let a), .failed(let b)):     return a == b
+        default:                                    return false
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class ImageViewModel {
+    private(set) var state = ImageState()
+    private var loadTask: Task<Void, Never>?
+    private let cache: ImageCache
+
+    init(cache: ImageCache = .shared) {
+        self.cache = cache
+    }
+
+    func send(_ action: ImageAction) {
+        switch action {
+        case .load(let url):      load(url: url)
+        case .cancel:             cancel()
+        case .invalidate(let url): Task { await cache.invalidate(url: url) }
+        }
+    }
+
+    private func load(url: URL) {
+        loadTask?.cancel()
+        state.phase = .loading
+        loadTask = Task {
+            do {
+                let uiImage = try await cache.image(for: url)
+                guard !Task.isCancelled else { return }
+                state.phase = .loaded(Image(uiImage: uiImage))
+            } catch {
+                guard !Task.isCancelled else { return }
+                state.phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func cancel() {
+        loadTask?.cancel()
+        state.phase = .idle
+    }
+}
+
+// CachedImageView.swift — modular, reusable image component
+struct CachedImageView: View {
+    let url: URL
+    @State private var vm = ImageViewModel()
+
+    var body: some View {
+        content
+            .task(id: url) { vm.send(.load(url: url)) }
+            .onDisappear { vm.send(.cancel) }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch vm.state.phase {
+        case .idle, .loading:
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemGray6))
+        case .loaded(let image):
+            image.resizable().scaledToFill()
+        case .failed:
+            Image(systemName: "photo.slash")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemGray6))
+        }
+    }
+}
+
+// MARK: — Swift Testing
+
+import Testing
+@testable import ImageCache
+
+// Mock cache — returns UIImage instantly, no disk I/O
+actor MockImageCache {
+    private(set) var requestedURLs: [URL] = []
+    var stubbedImage: UIImage? = UIImage(systemName: "star")
+    var stubbedError: Error? = nil
+
+    func image(for url: URL) async throws -> UIImage {
+        requestedURLs.append(url)
+        if let error = stubbedError { throw error }
+        return stubbedImage!
+    }
+
+    func invalidate(url: URL) async { }
+}
+
+@Suite("ImageViewModel")
+struct ImageViewModelTests {
+
+    @Test @MainActor
+    func initialPhaseIsIdle() {
+        let vm = ImageViewModel(cache: ImageCache.shared)  // swap for mock in real test
+        #expect(vm.state.phase == .idle)
+    }
+
+    @Test @MainActor
+    func loadSetsLoadingPhase() {
+        let vm = ImageViewModel()
+        let url = URL(string: "https://example.com/img.jpg")!
+        vm.send(.load(url: url))
+        #expect(vm.state.phase == .loading)
+    }
+
+    @Test @MainActor
+    func cancelResetsToIdle() {
+        let vm = ImageViewModel()
+        let url = URL(string: "https://example.com/img.jpg")!
+        vm.send(.load(url: url))
+        vm.send(.cancel)
+        #expect(vm.state.phase == .idle)
+    }
+}
+
+@Suite("ArticleCache Actor")
+struct ArticleCacheTests {
+
+    @Test
+    func storedArticlesAreRetrievable() async {
+        let cache = ArticleCache()
+        let articles = [
+            NewsArticle(id: UUID(), source: "TC", title: "Test", publishedAt: .now, url: URL(string: "https://example.com")!)
+        ]
+        await cache.store(articles, for: "TechCrunch")
+        let result = await cache.articles(for: "TechCrunch")
+        #expect(result?.count == 1)
+    }
+
+    @Test
+    func invalidationRemovesArticles() async {
+        let cache = ArticleCache()
+        let articles = [
+            NewsArticle(id: UUID(), source: "TC", title: "Test", publishedAt: .now, url: URL(string: "https://example.com")!)
+        ]
+        await cache.store(articles, for: "TechCrunch")
+        await cache.invalidate(source: "TechCrunch")
+        let result = await cache.articles(for: "TechCrunch")
+        #expect(result == nil)
+    }
+}
+```
+
+---
+
 ## Follow-up questions
 
 - *Why not just use `URLCache`?* (URLCache is HTTP-cache-policy-based and doesn't give you control over memory pressure behavior or custom TTL)
 - *What's an LRU eviction policy?* (Least Recently Used — evict the entry that was accessed furthest in the past; NSCache approximates this)
 - *How would you handle animated GIFs?* (Store as `Data`, return `UIImage.animatedImage`; or use a separate GIF decoder actor)
+- *How do you test the actor without real disk I/O?* (Inject a `CacheStorageProtocol` — real implementation uses `FileManager`; mock implementation uses an in-memory dictionary)

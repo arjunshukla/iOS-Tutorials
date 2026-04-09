@@ -452,8 +452,218 @@ actor RetryBudget {
 
 ---
 
+## MVVM Integration: `send(_:)` ViewModel wrapper
+
+```swift
+// RetryViewModel.swift — wraps ResilientHTTP in the standard send pattern
+import Observation
+
+enum RetryAction: Sendable {
+    case submitRequest(url: URL)
+    case cancel
+    case reset
+}
+
+struct RetryState: Equatable {
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case retrying(attempt: Int, of: Int, delay: TimeInterval)
+        case succeeded(statusCode: Int)
+        case failed(String)
+    }
+    var phase: Phase = .idle
+}
+
+@MainActor
+@Observable
+final class RetryViewModel {
+    private(set) var state = RetryState()
+    private var requestTask: Task<Void, Never>?
+    private let client: ResilientHTTP
+
+    init(client: ResilientHTTP = .shared) {
+        self.client = client
+    }
+
+    func send(_ action: RetryAction) {
+        switch action {
+        case .submitRequest(let url): submitRequest(url: url)
+        case .cancel:                 cancel()
+        case .reset:                  state.phase = .idle
+        }
+    }
+
+    private func submitRequest(url: URL) {
+        requestTask?.cancel()
+        state.phase = .loading
+
+        requestTask = Task {
+            do {
+                let response = try await client.request(
+                    URLRequest(url: url),
+                    onRetry: { [weak self] attempt in
+                        await MainActor.run {
+                            self?.state.phase = .retrying(
+                                attempt: attempt.attempt,
+                                of: attempt.maxAttempts,
+                                delay: attempt.delay
+                            )
+                        }
+                    }
+                )
+                guard !Task.isCancelled else { return }
+                state.phase = .succeeded(statusCode: response.statusCode)
+            } catch {
+                guard !Task.isCancelled else { return }
+                state.phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func cancel() {
+        requestTask?.cancel()
+        state.phase = .idle
+    }
+}
+
+// RetryStatusView.swift — modular display of retry state
+import SwiftUI
+
+struct RetryStatusView: View {
+    let phase: RetryState.Phase
+    let onSend: (RetryAction) -> Void
+
+    var body: some View {
+        Group {
+            switch phase {
+            case .idle:
+                Button("Send Request") {
+                    onSend(.submitRequest(url: URL(string: "https://api.example.com/data")!))
+                }
+                .buttonStyle(.borderedProminent)
+
+            case .loading:
+                HStack {
+                    ProgressView()
+                    Text("Sending…")
+                }
+
+            case .retrying(let attempt, let max, let delay):
+                VStack(spacing: 8) {
+                    ProgressView().tint(.orange)
+                    Text("Retry \(attempt)/\(max) — waiting \(delay, format: .number.precision(.fractionLength(1)))s")
+                        .font(.caption).foregroundStyle(.orange)
+                    Button("Cancel") { onSend(.cancel) }.buttonStyle(.bordered).tint(.red)
+                }
+
+            case .succeeded(let code):
+                VStack {
+                    Label("Success (\(code))", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Button("Reset") { onSend(.reset) }.buttonStyle(.bordered)
+                }
+
+            case .failed(let msg):
+                VStack {
+                    Label(msg, systemImage: "xmark.circle.fill").foregroundStyle(.red)
+                    Button("Retry") {
+                        onSend(.submitRequest(url: URL(string: "https://api.example.com/data")!))
+                    }.buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding()
+    }
+}
+
+// MARK: — Swift Testing
+
+import Testing
+@testable import ResilientHTTP
+
+// Controllable HTTP client for testing
+actor MockHTTPClient {
+    var callCount = 0
+    var stubbedResponses: [Result<HTTPResponse, Error>] = []
+
+    func next() async throws -> HTTPResponse {
+        callCount += 1
+        let response = stubbedResponses.isEmpty
+            ? .failure(URLError(.networkConnectionLost))
+            : stubbedResponses.removeFirst()
+        switch response {
+        case .success(let r): return r
+        case .failure(let e): throw e
+        }
+    }
+}
+
+@Suite("RetryPolicy")
+struct RetryPolicyTests {
+
+    @Test
+    func backoffDelayIsExponential() {
+        let policy = RetryPolicy(maxAttempts: 4, baseDelay: 1.0, maxDelay: 30, jitterStrategy: .none)
+        #expect(policy.delay(attempt: 0) == 1.0)
+        #expect(policy.delay(attempt: 1) == 2.0)
+        #expect(policy.delay(attempt: 2) == 4.0)
+        #expect(policy.delay(attempt: 3) == 8.0)
+    }
+
+    @Test
+    func delayIsCappedAtMaxDelay() {
+        let policy = RetryPolicy(maxAttempts: 10, baseDelay: 1.0, maxDelay: 5.0, jitterStrategy: .none)
+        #expect(policy.delay(attempt: 10) == 5.0)
+    }
+
+    @Test
+    func statusCodeRetryability() {
+        let policy = RetryPolicy.standard
+        #expect(policy.shouldRetry(statusCode: 503))
+        #expect(policy.shouldRetry(statusCode: 429))
+        #expect(!policy.shouldRetry(statusCode: 400))
+        #expect(!policy.shouldRetry(statusCode: 401))
+        #expect(!policy.shouldRetry(statusCode: 404))
+    }
+}
+
+@Suite("CircuitBreaker")
+struct CircuitBreakerTests {
+
+    @Test
+    func opensAfterFailureThreshold() {
+        var breaker = CircuitBreaker(failureThreshold: 3, resetTimeout: 60)
+        breaker.recordFailure()
+        breaker.recordFailure()
+        breaker.recordFailure()
+        if case .open = breaker.state { } else { Issue.record("Expected .open state") }
+    }
+
+    @Test
+    func closedInitially() {
+        let breaker = CircuitBreaker(failureThreshold: 3, resetTimeout: 60)
+        #expect(breaker.state == .closed)
+    }
+
+    @Test
+    func recordSuccessResetsFailureCount() {
+        var breaker = CircuitBreaker(failureThreshold: 3, resetTimeout: 60)
+        breaker.recordFailure()
+        breaker.recordFailure()
+        breaker.recordSuccess()  // reset
+        breaker.recordFailure()
+        breaker.recordFailure()
+        // Only 2 failures since last success — still closed
+        #expect(breaker.state == .closed)
+    }
+}
+```
+
+---
+
 ## Follow-up questions
 
 - *What's the thundering herd problem?* (Many clients retry in lockstep, creating periodic spikes that prevent server recovery)
 - *When would you NOT retry?* (4xx errors except 408/429; auth errors 401/403; client errors that won't change)
 - *How does a circuit breaker differ from rate limiting?* (Rate limiting is server-side; circuit breaker is client-side self-protection)
+- *How do you test retry logic without real network calls?* (Inject `MockHTTPClient` via protocol — stub failure responses until the Nth call succeeds, assert `callCount == N`)

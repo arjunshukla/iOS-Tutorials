@@ -1,192 +1,242 @@
 # Tutorial 08 — Pagination
 ## Build: InfiniteList — a feed with cursor-based pagination
-**Time:** 60 min | **Swift 6 + SwiftUI** | **Topics:** Cursor vs offset pagination, prefetching, pull-to-refresh, skeleton loading
+**Time:** 45 min | **Swift 6 + SwiftUI** | **Topics:** Cursor vs offset pagination, prefetching, pull-to-refresh, skeleton loading, MVVM state machine, Swift Testing
 
 ---
 
 ## What you'll build
-An infinite-scroll list with:
+An infinite-scroll feed with:
 - Cursor-based pagination (production standard)
-- Prefetch 2 pages ahead of the visible position
+- Prefetch next page while current page renders
 - Pull-to-refresh that resets pagination
 - Skeleton loading placeholders
-- Deduplication of items across pages
+- Deduplication across pages
 
 ---
 
-## Cursor vs Offset pagination
+## Cursor vs Offset
 
 ```
-Offset pagination:                  Cursor pagination:
-GET /items?page=2&limit=20          GET /items?after=<cursor>&limit=20
+Offset:  GET /items?page=2&limit=20      → shifts when items inserted mid-scroll
+Cursor:  GET /items?after=<id>&limit=20  → stable, server uses indexed seek
+```
 
-Problems:                           Advantages:
-- Items inserted during scroll      - Stable across inserts
-  shift page boundaries             - Works with real-time feeds
-- Expensive COUNT(*) queries        - Server can use indexed seek
-- Can skip or duplicate items       - Used by Twitter, Instagram, Whatnot
+Twitter, Instagram, and Whatnot all use cursor pagination.
+
+---
+
+## Architecture
+
+```
+FeedView
+├── FeedSkeletonList        ← shimmer placeholders during first load
+├── FeedItemList            ← real items + prefetch trigger
+│   └── FeedItemRow
+└── FeedFooter              ← spinner / end-of-feed / retry
+
+FeedViewModel               ← owns PaginationState, exposes send(_:)
+└── FeedServiceProtocol     ← injectable page fetcher
 ```
 
 ---
 
-## Step 1 — Page and cursor models (~5 min)
+## Step 1 — Models (~5 min)
 
 ```swift
-// PaginationModels.swift
+// Models.swift
 import Foundation
-
-struct Page<T: Sendable>: Sendable {
-    let items: [T]
-    let nextCursor: String?    // nil = last page
-    let previousCursor: String?
-    let totalCount: Int?       // optional — not always available
-
-    var hasNextPage: Bool { nextCursor != nil }
-    var isEmpty: Bool { items.isEmpty }
-}
 
 struct FeedItem: Identifiable, Sendable, Hashable {
     let id: UUID
     let title: String
     let subtitle: String
-    let imageURL: URL?
-    let timestamp: Date
-    let cursor: String   // the cursor that produced this item
+    let cursor: String
 
-    static func generate(cursor: String? = nil) -> FeedItem {
-        let id = UUID()
-        return FeedItem(
-            id: id,
+    static func stub(cursor: String = UUID().uuidString) -> FeedItem {
+        FeedItem(
+            id: UUID(),
             title: "Item \(Int.random(in: 1000...9999))",
-            subtitle: "Posted \(Int.random(in: 1...60)) minutes ago",
-            imageURL: URL(string: "https://picsum.photos/seed/\(id)/300/200"),
-            timestamp: .now.addingTimeInterval(-Double.random(in: 0...3600)),
-            cursor: cursor ?? UUID().uuidString
+            subtitle: "Posted \(Int.random(in: 1...60)) min ago",
+            cursor: cursor
         )
     }
 }
 
-struct PaginationState: Sendable {
-    var items: [FeedItem] = []
-    var nextCursor: String? = nil
-    var isLoadingFirstPage: Bool = false
-    var isLoadingNextPage: Bool = false
-    var hasNextPage: Bool = true
-    var error: String? = nil
-    var seenIDs: Set<UUID> = []   // deduplication
+struct Page<T: Sendable>: Sendable {
+    let items: [T]
+    let nextCursor: String?
+    var hasNextPage: Bool { nextCursor != nil }
+}
 
-    mutating func apply(_ page: Page<FeedItem>) {
-        // Deduplicate in case of overlapping pages
-        let newItems = page.items.filter { !seenIDs.contains($0.id) }
-        seenIDs.formUnion(newItems.map(\.id))
-        items.append(contentsOf: newItems)
+// ★ All pagination state in one Equatable struct
+struct PaginationState: Equatable {
+    var items: [FeedItem]        = []
+    var nextCursor: String?      = nil
+    var isLoadingFirstPage: Bool = false
+    var isLoadingNextPage: Bool  = false
+    var hasNextPage: Bool        = true
+    var error: String?           = nil
+    private var seenIDs: Set<UUID> = []
+
+    mutating func reset() {
+        self = PaginationState()
+    }
+
+    mutating func applyFirstPage(_ page: Page<FeedItem>) {
+        reset()
+        applyPage(page)
+    }
+
+    mutating func applyPage(_ page: Page<FeedItem>) {
+        let new = page.items.filter { !seenIDs.contains($0.id) }
+        seenIDs.formUnion(new.map(\.id))
+        items.append(contentsOf: new)
         nextCursor = page.nextCursor
         hasNextPage = page.hasNextPage
+    }
+
+    // Equatable: ignore seenIDs (internal implementation detail)
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.items == rhs.items &&
+        lhs.nextCursor == rhs.nextCursor &&
+        lhs.isLoadingFirstPage == rhs.isLoadingFirstPage &&
+        lhs.isLoadingNextPage == rhs.isLoadingNextPage &&
+        lhs.hasNextPage == rhs.hasNextPage &&
+        lhs.error == rhs.error
     }
 }
 ```
 
 ---
 
-## Step 2 — Feed service (~10 min)
+## Step 2 — Service protocol (~5 min)
 
 ```swift
 // FeedService.swift
 import Foundation
 
-// Simulates a cursor-based API
-actor FeedService {
+// ★ Protocol = swap actor for MockFeedService in tests
+protocol FeedServiceProtocol: Sendable {
+    func fetchPage(after cursor: String?) async throws -> Page<FeedItem>
+}
 
+actor FeedService: FeedServiceProtocol {
     static let pageSize = 20
+    private var pageNumber = 0
 
     func fetchPage(after cursor: String? = nil) async throws -> Page<FeedItem> {
-        // Simulate network latency
         try await Task.sleep(for: .milliseconds(Int.random(in: 600...1000)))
-
-        // Simulate occasional error
-        if Bool.random() && Bool.random() {
-            throw FeedError.networkError
-        }
-
-        // Generate a page of items
-        let items = (0..<Self.pageSize).map { _ in
-            FeedItem.generate(cursor: cursor)
-        }
-
-        // Return nil nextCursor after 5 pages to simulate end
-        let pageNumber = cursor.map { Int($0.prefix(1)) ?? 0 } ?? 0
-        let nextCursor = pageNumber < 5 ? String(pageNumber + 1) + UUID().uuidString : nil
-
-        return Page(
-            items: items,
-            nextCursor: nextCursor,
-            previousCursor: cursor,
-            totalCount: nil
-        )
+        let items = (0..<Self.pageSize).map { _ in FeedItem.stub(cursor: cursor ?? "root") }
+        pageNumber += 1
+        let nextCursor = pageNumber < 5 ? UUID().uuidString : nil
+        return Page(items: items, nextCursor: nextCursor)
     }
 }
 
-enum FeedError: Error {
-    case networkError
+// Controllable mock — deterministic, no latency
+actor MockFeedService: FeedServiceProtocol {
+    var pages: [Page<FeedItem>] = []
+    var error: Error? = nil
+    private(set) var callCount = 0
+
+    func fetchPage(after cursor: String?) async throws -> Page<FeedItem> {
+        callCount += 1
+        if let error { throw error }
+        let page = pages.isEmpty ? Page<FeedItem>(items: [], nextCursor: nil) : pages.removeFirst()
+        return page
+    }
 }
 ```
 
 ---
 
-## Step 3 — ViewModel with prefetch logic (~15 min)
+## Step 3 — ViewModel with `send(_:)` dispatch (~15 min)
 
 ```swift
 // FeedViewModel.swift
 import Observation
 
+enum FeedAction: Sendable {
+    case loadFirstPage
+    case loadNextPage
+    case refresh
+    case itemAppeared(FeedItem)
+    case retry
+}
+
+@MainActor
+protocol FeedViewModelProtocol: AnyObject {
+    var state: PaginationState { get }
+    func send(_ action: FeedAction)
+}
+
 @MainActor
 @Observable
-final class FeedViewModel {
+final class FeedViewModel: FeedViewModelProtocol {
 
     private(set) var state = PaginationState()
-    private let service = FeedService()
+
     private var loadTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
-    private var prefetchedPage: Page<FeedItem>?   // pre-loaded next page
+    private var prefetchedPage: Page<FeedItem>?
 
-    // MARK: - Public interface
+    private let service: any FeedServiceProtocol
+    private let prefetchThreshold: Int
 
-    func loadFirstPage() {
+    init(
+        service: any FeedServiceProtocol = FeedService(),
+        prefetchThreshold: Int = 5
+    ) {
+        self.service = service
+        self.prefetchThreshold = prefetchThreshold
+    }
+
+    // ★ Single dispatch — all state transitions here
+    func send(_ action: FeedAction) {
+        switch action {
+        case .loadFirstPage:          loadFirstPage()
+        case .loadNextPage:           loadNextPage()
+        case .refresh:                Task { await refresh() }
+        case .itemAppeared(let item): checkPrefetch(for: item)
+        case .retry:                  loadNextPage()
+        }
+    }
+
+    // MARK: - Private handlers
+
+    private func loadFirstPage() {
         guard !state.isLoadingFirstPage else { return }
         loadTask?.cancel()
-
-        state = PaginationState()  // reset
+        prefetchTask?.cancel()
+        prefetchedPage = nil
+        state.reset()
+        state.isLoadingFirstPage = true
 
         loadTask = Task {
-            state.isLoadingFirstPage = true
-            state.error = nil
-
             do {
                 let page = try await service.fetchPage(after: nil)
                 guard !Task.isCancelled else { return }
-                state.apply(page)
-                // Immediately prefetch page 2
+                state.applyFirstPage(page)
                 schedulePrefetch()
             } catch {
                 state.error = error.localizedDescription
             }
-
             state.isLoadingFirstPage = false
         }
     }
 
-    func loadNextPage() {
+    private func loadNextPage() {
         guard !state.isLoadingNextPage,
               state.hasNextPage,
               !state.isLoadingFirstPage
         else { return }
 
-        loadTask = Task {
-            state.isLoadingNextPage = true
-            state.error = nil
+        state.isLoadingNextPage = true
+        state.error = nil
 
+        loadTask = Task {
             do {
-                // Use pre-fetched page if available
+                // ★ Use pre-fetched page if available — zero wait for the user
                 let page: Page<FeedItem>
                 if let prefetched = prefetchedPage {
                     page = prefetched
@@ -194,32 +244,26 @@ final class FeedViewModel {
                 } else {
                     page = try await service.fetchPage(after: state.nextCursor)
                 }
-
                 guard !Task.isCancelled else { return }
-                state.apply(page)
-
-                // Pre-fetch next page
+                state.applyPage(page)
                 schedulePrefetch()
-
             } catch {
                 state.error = error.localizedDescription
             }
-
             state.isLoadingNextPage = false
         }
     }
 
-    func refresh() async {
+    private func refresh() async {
         loadTask?.cancel()
         prefetchTask?.cancel()
         prefetchedPage = nil
-
-        state = PaginationState()
+        state.reset()
         state.isLoadingFirstPage = true
 
         do {
             let page = try await service.fetchPage(after: nil)
-            state.apply(page)
+            state.applyFirstPage(page)
             schedulePrefetch()
         } catch {
             state.error = error.localizedDescription
@@ -228,27 +272,21 @@ final class FeedViewModel {
         state.isLoadingFirstPage = false
     }
 
-    // ★ Prefetch: called when user is N items from the end
-    func onItemAppeared(item: FeedItem) {
-        let threshold = 5  // trigger load when 5 items from end
+    // ★ Trigger next page when user is within threshold items of end
+    private func checkPrefetch(for item: FeedItem) {
         guard let index = state.items.firstIndex(where: { $0.id == item.id }),
-              index >= state.items.count - threshold
+              index >= state.items.count - prefetchThreshold
         else { return }
         loadNextPage()
     }
-
-    // MARK: - Private
 
     private func schedulePrefetch() {
         guard state.hasNextPage, let cursor = state.nextCursor else { return }
         prefetchTask?.cancel()
         prefetchTask = Task {
-            // Slight delay so first page renders before we start prefetch
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await Task.sleep(for: .milliseconds(200))
             guard !Task.isCancelled else { return }
-            let page = try? await service.fetchPage(after: cursor)
-            guard !Task.isCancelled else { return }
-            prefetchedPage = page
+            prefetchedPage = try? await service.fetchPage(after: cursor)
         }
     }
 }
@@ -256,67 +294,13 @@ final class FeedViewModel {
 
 ---
 
-## Step 4 — SwiftUI view with skeleton loading (~15 min)
+## Step 4 — Modular views (~10 min)
 
 ```swift
-// FeedView.swift
+// FeedItemRow.swift
 import SwiftUI
 
-struct FeedView: View {
-    @State private var vm = FeedViewModel()
-
-    var body: some View {
-        NavigationStack {
-            List {
-                // Skeleton loading for first page
-                if vm.state.isLoadingFirstPage {
-                    ForEach(0..<10, id: \.self) { _ in
-                        SkeletonRow()
-                    }
-                } else {
-                    // Actual items
-                    ForEach(vm.state.items) { item in
-                        FeedRow(item: item)
-                            .onAppear { vm.onItemAppeared(item: item) }
-                    }
-
-                    // Next-page loader / end state
-                    if vm.state.isLoadingNextPage {
-                        HStack {
-                            Spacer()
-                            ProgressView()
-                            Spacer()
-                        }
-                        .listRowSeparator(.hidden)
-                    } else if !vm.state.hasNextPage {
-                        HStack {
-                            Spacer()
-                            Text("You're all caught up 🎉")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .listRowSeparator(.hidden)
-                    }
-
-                    // Error + retry
-                    if let error = vm.state.error {
-                        VStack {
-                            Text(error).font(.caption).foregroundStyle(.red)
-                            Button("Retry") { vm.loadNextPage() }
-                        }
-                    }
-                }
-            }
-            .listStyle(.plain)
-            .navigationTitle("Feed")
-            .refreshable { await vm.refresh() }
-            .task { vm.loadFirstPage() }
-        }
-    }
-}
-
-struct FeedRow: View {
+struct FeedItemRow: View {
     let item: FeedItem
 
     var body: some View {
@@ -324,9 +308,6 @@ struct FeedRow: View {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color(.systemGray5))
                 .frame(width: 60, height: 60)
-                .overlay(
-                    Text("📷")
-                )
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(item.title).font(.headline)
@@ -338,61 +319,292 @@ struct FeedRow: View {
     }
 }
 
-// Shimmer skeleton placeholder
+// FeedSkeletonList.swift
+struct FeedSkeletonList: View {
+    var body: some View {
+        ForEach(0..<10, id: \.self) { _ in SkeletonRow() }
+    }
+}
+
 struct SkeletonRow: View {
-    @State private var shimmer: Bool = false
+    @State private var shimmer = false
 
     var body: some View {
         HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(gradient)
-                .frame(width: 60, height: 60)
-
+            RoundedRectangle(cornerRadius: 8).fill(shimmerGradient).frame(width: 60, height: 60)
             VStack(alignment: .leading, spacing: 8) {
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(gradient)
-                    .frame(height: 16)
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(gradient)
-                    .frame(width: 140, height: 12)
+                RoundedRectangle(cornerRadius: 4).fill(shimmerGradient).frame(height: 16)
+                RoundedRectangle(cornerRadius: 4).fill(shimmerGradient).frame(width: 140, height: 12)
             }
         }
         .padding(.vertical, 4)
         .onAppear {
-            withAnimation(.easeInOut(duration: 1.2).repeatForever()) {
-                shimmer.toggle()
-            }
+            withAnimation(.easeInOut(duration: 1.2).repeatForever()) { shimmer.toggle() }
         }
     }
 
-    private var gradient: LinearGradient {
+    private var shimmerGradient: LinearGradient {
         LinearGradient(
             colors: shimmer
                 ? [Color(.systemGray5), Color(.systemGray4), Color(.systemGray5)]
                 : [Color(.systemGray4), Color(.systemGray5), Color(.systemGray4)],
-            startPoint: .leading,
-            endPoint: .trailing
+            startPoint: .leading, endPoint: .trailing
         )
+    }
+}
+
+// FeedFooter.swift
+struct FeedFooter: View {
+    let isLoadingNextPage: Bool
+    let hasNextPage: Bool
+    let error: String?
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack {
+            Spacer()
+            content
+            Spacer()
+        }
+        .listRowSeparator(.hidden)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if isLoadingNextPage {
+            ProgressView()
+        } else if let error {
+            VStack(spacing: 8) {
+                Text(error).font(.caption).foregroundStyle(.red)
+                Button("Retry", action: onRetry).buttonStyle(.bordered)
+            }
+        } else if !hasNextPage {
+            Text("You're all caught up")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+// FeedItemList.swift
+struct FeedItemList: View {
+    let items: [FeedItem]
+    let state: PaginationState
+    let onItemAppear: (FeedItem) -> Void
+    let onRetry: () -> Void
+
+    var body: some View {
+        ForEach(items) { item in
+            FeedItemRow(item: item)
+                .onAppear { onItemAppear(item) }
+        }
+
+        FeedFooter(
+            isLoadingNextPage: state.isLoadingNextPage,
+            hasNextPage: state.hasNextPage,
+            error: state.error,
+            onRetry: onRetry
+        )
+    }
+}
+
+// FeedView.swift — root view
+struct FeedView: View {
+    @State private var vm = FeedViewModel()
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if vm.state.isLoadingFirstPage {
+                    FeedSkeletonList()
+                } else {
+                    FeedItemList(
+                        items: vm.state.items,
+                        state: vm.state,
+                        onItemAppear: { vm.send(.itemAppeared($0)) },
+                        onRetry: { vm.send(.retry) }
+                    )
+                }
+            }
+            .listStyle(.plain)
+            .navigationTitle("Feed")
+            .refreshable { vm.send(.refresh) }
+            .task { vm.send(.loadFirstPage) }
+        }
     }
 }
 ```
 
 ---
 
-## ★ Challenge
-
-Implement **bidirectional pagination** — support loading both newer and older content (like a message thread where you join in the middle):
+## Step 5 — Swift Testing suite (~10 min)
 
 ```swift
-struct BidirectionalState<T: Identifiable & Sendable & Hashable> {
-    var items: [T] = []
-    var newerCursor: String? = nil
-    var olderCursor: String? = nil
-    var isLoadingNewer = false
-    var isLoadingOlder = false
+// FeedViewModelTests.swift
+import Testing
+@testable import InfiniteList
 
-    mutating func prepend(_ page: Page<T>) { ... }
-    mutating func append(_ page: Page<T>) { ... }
+@Suite("FeedViewModel")
+struct FeedViewModelTests {
+
+    // MARK: - Helpers
+
+    @MainActor
+    private func makeVM(
+        pages: [Page<FeedItem>] = [],
+        error: Error? = nil,
+        prefetchThreshold: Int = 5
+    ) async -> (FeedViewModel, MockFeedService) {
+        let service = MockFeedService()
+        await service.stubPages(pages, error: error)
+        let vm = FeedViewModel(service: service, prefetchThreshold: prefetchThreshold)
+        return (vm, service)
+    }
+
+    // MARK: - Initial state
+
+    @Test @MainActor
+    func initialStateIsEmpty() async {
+        let (vm, _) = await makeVM()
+        #expect(vm.state.items.isEmpty)
+        #expect(!vm.state.isLoadingFirstPage)
+        #expect(vm.state.hasNextPage)
+    }
+
+    // MARK: - First page load
+
+    @Test @MainActor
+    func loadFirstPagePopulatesItems() async throws {
+        let items = (0..<3).map { _ in FeedItem.stub() }
+        let page = Page(items: items, nextCursor: nil)
+        let (vm, _) = await makeVM(pages: [page])
+
+        vm.send(.loadFirstPage)
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(vm.state.items.count == 3)
+        #expect(!vm.state.isLoadingFirstPage)
+        #expect(!vm.state.hasNextPage)
+    }
+
+    @Test @MainActor
+    func loadFirstPageSetsLoadingFlag() async {
+        let (vm, _) = await makeVM()
+        vm.send(.loadFirstPage)
+        #expect(vm.state.isLoadingFirstPage)
+    }
+
+    @Test @MainActor
+    func doubleLoadFirstPageIsIgnored() async throws {
+        let page = Page(items: [FeedItem.stub()], nextCursor: nil)
+        let (vm, service) = await makeVM(pages: [page])
+
+        vm.send(.loadFirstPage)
+        vm.send(.loadFirstPage)     // second call while loading — should be ignored
+        try await Task.sleep(for: .milliseconds(10))
+
+        let count = await service.callCount
+        #expect(count == 1)
+    }
+
+    // MARK: - Next page
+
+    @Test @MainActor
+    func loadNextPageAppendsItems() async throws {
+        let page1 = Page(items: [FeedItem.stub()], nextCursor: "cursor-2")
+        let page2 = Page(items: [FeedItem.stub()], nextCursor: nil)
+        let (vm, _) = await makeVM(pages: [page1, page2])
+
+        vm.send(.loadFirstPage)
+        try await Task.sleep(for: .milliseconds(10))
+
+        vm.send(.loadNextPage)
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(vm.state.items.count == 2)
+    }
+
+    @Test @MainActor
+    func loadNextPageWhenNoNextPageIsNoop() async throws {
+        let page = Page(items: [FeedItem.stub()], nextCursor: nil)
+        let (vm, service) = await makeVM(pages: [page])
+
+        vm.send(.loadFirstPage)
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(!vm.state.hasNextPage)
+
+        vm.send(.loadNextPage)
+        try await Task.sleep(for: .milliseconds(10))
+
+        let count = await service.callCount
+        #expect(count == 1)  // no second call
+    }
+
+    // MARK: - Error handling
+
+    @Test @MainActor
+    func errorPopulatesStateError() async throws {
+        struct FeedTestError: Error, LocalizedError {
+            var errorDescription: String? { "Network failure" }
+        }
+        let (vm, _) = await makeVM(error: FeedTestError())
+
+        vm.send(.loadFirstPage)
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(vm.state.error == "Network failure")
+    }
+
+    // MARK: - Deduplication
+
+    @Test @MainActor
+    func duplicateItemsAreFiltered() async throws {
+        let duplicate = FeedItem.stub()
+        let page1 = Page(items: [duplicate], nextCursor: "next")
+        let page2 = Page(items: [duplicate, FeedItem.stub()], nextCursor: nil)
+        let (vm, _) = await makeVM(pages: [page1, page2])
+
+        vm.send(.loadFirstPage)
+        try await Task.sleep(for: .milliseconds(10))
+        vm.send(.loadNextPage)
+        try await Task.sleep(for: .milliseconds(10))
+
+        // Duplicate filtered — only 2 unique items
+        #expect(vm.state.items.count == 2)
+    }
+
+    // MARK: - PaginationState unit tests
+
+    @Test
+    func applyPageDeduplicates() {
+        var state = PaginationState()
+        let item = FeedItem.stub()
+        let page1 = Page(items: [item], nextCursor: "c")
+        let page2 = Page(items: [item], nextCursor: nil)  // same item again
+
+        state.applyFirstPage(page1)
+        state.applyPage(page2)
+
+        #expect(state.items.count == 1)
+    }
+
+    @Test
+    func resetClearsAllState() {
+        var state = PaginationState()
+        state.applyFirstPage(Page(items: [FeedItem.stub()], nextCursor: "x"))
+        state.reset()
+
+        #expect(state.items.isEmpty)
+        #expect(state.nextCursor == nil)
+        #expect(state.hasNextPage)
+    }
+}
+
+// MockFeedService helper
+extension MockFeedService {
+    func stubPages(_ pages: [Page<FeedItem>], error: Error?) {
+        self.pages = pages
+        self.error = error
+    }
 }
 ```
 
@@ -400,16 +612,16 @@ struct BidirectionalState<T: Identifiable & Sendable & Hashable> {
 
 ## Key concepts to remember
 
-**Why cursor over offset?** A live feed with new items inserted between loads will show duplicates with offset pagination (page 2 slides to become the old page 1 content). Cursors are anchored to a specific item.
+**`applyPage` on value type:** `PaginationState` is a struct — mutation is isolated. Tests can call `state.applyPage()` directly without any ViewModel, network, or async machinery.
 
-**Prefetch timing:** Start prefetch when the user is 5 items from the end (not 1). Network latency means you need a buffer. At Whatnot's scale with live auctions, you'd prefetch entire next pages as background Tasks.
+**Prefetch timing:** Trigger load when user is `prefetchThreshold` items from the end (not 1). At Whatnot's scale with live auctions, you prefetch 2+ pages ahead. The threshold is injectable so tests can set it to `1`.
 
-**Deduplication:** Even with cursors, real-time inserts can cause edge items to appear on two pages. Always check `seenIDs`.
+**`MockFeedService.pages` queue:** Stub pages as a `[Page<FeedItem>]` array. Each `fetchPage` call removes and returns the first one — simulates sequential cursor pages deterministically.
 
 ---
 
 ## Follow-up questions
 
-- *How does cursor pagination work when items are deleted?* (Cursor is anchored to item ID or timestamp; deleted items are just absent from results)
-- *How would you implement page caching?* (Store `[cursor: Page]` in the cache actor from Tutorial 07)
-- *What's the difference between `onAppear` and `prefetchRows` in UIKit?* (`UITableViewDataSourcePrefetching` triggers earlier than `onAppear` — at 20+ rows ahead)
+- *How does cursor pagination handle item deletion?* (Cursor anchors to an ID or timestamp — deleted items are simply absent from results, no index shifting)
+- *How would you add bidirectional pagination?* (`BidirectionalState` with `newerCursor` + `olderCursor`, `prepend` + `append` mutating methods)
+- *What's the difference between `onAppear` and `UITableViewDataSourcePrefetching`?* (`prefetchRows` fires ~20 rows ahead of visibility; `onAppear` fires at the moment of display — always use a threshold buffer with `onAppear`)

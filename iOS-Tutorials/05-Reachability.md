@@ -171,55 +171,92 @@ enum NetworkStatus: Equatable, Sendable {
 
 ---
 
-## Step 2 — ViewModel consuming the stream (~10 min)
+## Step 2 — State + ViewModel with `send(_:)` (~10 min)
 
 ```swift
 // ConnectivityViewModel.swift
 import Observation
 import SwiftUI
 
+// ★ Actions — all user/system intents modeled as enum cases
+enum ConnectivityAction: Sendable {
+    case startMonitoring
+    case stopMonitoring
+    case dismissBanner
+}
+
+// ★ All view state in one Equatable struct
+struct ConnectivityState: Equatable {
+    var networkStatus: NetworkStatus      = .unknown
+    var isBannerVisible: Bool             = false
+    var wasOffline: Bool                  = false
+
+    var isOnWifi: Bool {
+        networkStatus == .connected(.wifi) || networkStatus == .connected(.wiredEthernet)
+    }
+    var isExpensive: Bool { networkStatus == .connected(.cellular) }
+}
+
+// ★ Protocol for injectable monitor (testable without real NWPathMonitor)
+protocol NetworkMonitorProtocol: Sendable {
+    func statusStream() -> AsyncStream<NetworkStatus>
+    var status: NetworkStatus { get }
+}
+extension NetworkMonitor: NetworkMonitorProtocol {}
+
+@MainActor
+protocol ConnectivityViewModelProtocol: AnyObject {
+    var state: ConnectivityState { get }
+    func send(_ action: ConnectivityAction)
+}
+
 @MainActor
 @Observable
-final class ConnectivityViewModel {
+final class ConnectivityViewModel: ConnectivityViewModelProtocol {
 
-    var networkStatus: NetworkStatus = .unknown
-    var isOfflineBannerVisible: Bool = false
-    var wasOffline: Bool = false   // track transitions for toast UX
-
+    private(set) var state = ConnectivityState()
     private var monitorTask: Task<Void, Never>?
+    private let monitor: any NetworkMonitorProtocol
 
-    func startMonitoring() {
+    init(monitor: any NetworkMonitorProtocol = NetworkMonitor.shared) {
+        self.monitor = monitor
+    }
+
+    // ★ Single dispatch point
+    func send(_ action: ConnectivityAction) {
+        switch action {
+        case .startMonitoring: startMonitoring()
+        case .stopMonitoring:  stopMonitoring()
+        case .dismissBanner:   state.isBannerVisible = false
+        }
+    }
+
+    // MARK: - Private handlers
+
+    private func startMonitoring() {
+        guard monitorTask == nil else { return }
         monitorTask = Task {
-            for await status in NetworkMonitor.shared.statusStream() {
+            for await status in monitor.statusStream() {
                 guard !Task.isCancelled else { break }
-
-                let wasConnected = networkStatus.isConnected
-                networkStatus = status
-
-                // Show banner when going offline
-                if !status.isConnected {
-                    wasOffline = true
-                    withAnimation(.spring) { isOfflineBannerVisible = true }
-                } else if wasOffline {
-                    // Was offline, now back — show brief "Connected" toast
-                    withAnimation(.spring) { isOfflineBannerVisible = false }
-                    // Could trigger a data refresh here
-                }
+                apply(status: status)
             }
         }
     }
 
-    func stopMonitoring() {
+    private func stopMonitoring() {
         monitorTask?.cancel()
+        monitorTask = nil
     }
 
-    // Useful for feature flags: "only sync if on WiFi"
-    var isOnWifi: Bool {
-        networkStatus == .connected(.wifi) || networkStatus == .connected(.wiredEthernet)
-    }
-
-    var isExpensive: Bool {
-        networkStatus == .connected(.cellular)
+    private func apply(status: NetworkStatus) {
+        state.networkStatus = status
+        if !status.isConnected {
+            state.wasOffline = true
+            withAnimation(.spring) { state.isBannerVisible = true }
+        } else if state.wasOffline {
+            withAnimation(.spring) { state.isBannerVisible = false }
+            // Coordinator integration: trigger data refresh here
+        }
     }
 }
 ```
@@ -287,64 +324,11 @@ enum NetworkError: Error, LocalizedError {
 
 ---
 
-## Step 4 — SwiftUI integration with offline banner (~15 min)
+## Step 4 — Modular views + Swift Testing (~15 min)
 
 ```swift
-// ContentView.swift
+// StatusRow.swift
 import SwiftUI
-
-struct ContentView: View {
-    @State private var vm = ConnectivityViewModel()
-
-    var body: some View {
-        ZStack(alignment: .top) {
-            mainContent
-
-            // Offline banner — slides in from top
-            if vm.isOfflineBannerVisible {
-                OfflineBanner(status: vm.networkStatus)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(1)
-            }
-        }
-        .task { vm.startMonitoring() }
-        .onDisappear { vm.stopMonitoring() }
-        .animation(.spring(duration: 0.4), value: vm.isOfflineBannerVisible)
-    }
-
-    private var mainContent: some View {
-        NavigationStack {
-            List {
-                Section("Network status") {
-                    StatusRow(status: vm.networkStatus)
-                }
-
-                Section("Connection details") {
-                    LabeledContent("On Wi-Fi",  value: vm.isOnWifi  ? "Yes" : "No")
-                    LabeledContent("Expensive", value: vm.isExpensive ? "Yes (cellular)" : "No")
-                }
-
-                Section("What this enables") {
-                    if vm.isOnWifi {
-                        Label("HD video streaming OK", systemImage: "video.fill")
-                            .foregroundStyle(.green)
-                        Label("Background sync OK",    systemImage: "arrow.clockwise")
-                            .foregroundStyle(.green)
-                    } else if vm.isExpensive {
-                        Label("Limit video quality",  systemImage: "video.badge.ellipsis")
-                            .foregroundStyle(.orange)
-                        Label("Pause heavy syncs",    systemImage: "pause.circle")
-                            .foregroundStyle(.orange)
-                    } else {
-                        Label("Showing cached content only", systemImage: "tray.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .navigationTitle("NetworkAware")
-        }
-    }
-}
 
 struct StatusRow: View {
     let status: NetworkStatus
@@ -352,40 +336,162 @@ struct StatusRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: status.icon)
-                .foregroundStyle(status.isConnected ? .green : .red)
-                .font(.title2)
+                .foregroundStyle(status.isConnected ? .green : .red).font(.title2)
             VStack(alignment: .leading) {
                 Text(status.label).font(.headline)
-                Text("Network.framework / NWPathMonitor")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("Network.framework / NWPathMonitor").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            Circle()
-                .fill(status.isConnected ? Color.green : Color.red)
-                .frame(width: 10, height: 10)
+            Circle().fill(status.isConnected ? Color.green : Color.red).frame(width: 10, height: 10)
         }
     }
 }
 
+// OfflineBanner.swift — pure display, accepts dismiss callback
 struct OfflineBanner: View {
     let status: NetworkStatus
+    let onDismiss: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: status.icon)
-            Text(status.label)
-                .font(.subheadline.weight(.medium))
+            Text(status.label).font(.subheadline.weight(.medium))
+            Spacer()
+            Button { onDismiss() } label: { Image(systemName: "xmark") }
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .background(
-            Capsule()
-                .fill(status.isConnected ? Color.green : Color.red.opacity(0.9))
-        )
-        .padding(.top, 8)
-        .shadow(radius: 8)
+        .padding(.horizontal, 20).padding(.vertical, 12)
+        .background(Capsule().fill(status.isConnected ? Color.green : Color.red.opacity(0.9)))
+        .padding(.top, 8).shadow(radius: 8)
+    }
+}
+
+// ConnectionDetailsSection.swift
+struct ConnectionDetailsSection: View {
+    let state: ConnectivityState
+
+    var body: some View {
+        Section("Connection details") {
+            LabeledContent("On Wi-Fi",  value: state.isOnWifi   ? "Yes" : "No")
+            LabeledContent("Expensive", value: state.isExpensive ? "Yes (cellular)" : "No")
+        }
+        Section("What this enables") {
+            if state.isOnWifi {
+                Label("HD video streaming OK", systemImage: "video.fill").foregroundStyle(.green)
+                Label("Background sync OK",    systemImage: "arrow.clockwise").foregroundStyle(.green)
+            } else if state.isExpensive {
+                Label("Limit video quality",   systemImage: "video.badge.ellipsis").foregroundStyle(.orange)
+                Label("Pause heavy syncs",     systemImage: "pause.circle").foregroundStyle(.orange)
+            } else {
+                Label("Showing cached content only", systemImage: "tray.fill").foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+// NetworkAwareView.swift — root view
+struct NetworkAwareView: View {
+    @State private var vm = ConnectivityViewModel()
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            NavigationStack {
+                List {
+                    Section("Network status") { StatusRow(status: vm.state.networkStatus) }
+                    ConnectionDetailsSection(state: vm.state)
+                }
+                .navigationTitle("NetworkAware")
+            }
+
+            if vm.state.isBannerVisible {
+                OfflineBanner(
+                    status: vm.state.networkStatus,
+                    onDismiss: { vm.send(.dismissBanner) }
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(1)
+            }
+        }
+        .animation(.spring(duration: 0.4), value: vm.state.isBannerVisible)
+        .task { vm.send(.startMonitoring) }
+        .onDisappear { vm.send(.stopMonitoring) }
+    }
+}
+
+// MARK: — Swift Testing
+
+// MockNetworkMonitor — controllable, no real NWPathMonitor
+final class MockNetworkMonitor: NetworkMonitorProtocol, @unchecked Sendable {
+    var status: NetworkStatus = .unknown
+    private let stream: AsyncStream<NetworkStatus>
+    private var continuation: AsyncStream<NetworkStatus>.Continuation?
+
+    init() {
+        var cont: AsyncStream<NetworkStatus>.Continuation?
+        stream = AsyncStream { cont = $0 }
+        continuation = cont
+    }
+
+    func statusStream() -> AsyncStream<NetworkStatus> { stream }
+    func emit(_ status: NetworkStatus) { self.status = status; continuation?.yield(status) }
+}
+
+import Testing
+@testable import NetworkAware
+
+@Suite("ConnectivityViewModel")
+struct ConnectivityViewModelTests {
+
+    @Test @MainActor
+    func initialStateIsUnknown() {
+        let vm = ConnectivityViewModel(monitor: MockNetworkMonitor())
+        #expect(vm.state.networkStatus == .unknown)
+        #expect(!vm.state.isBannerVisible)
+    }
+
+    @Test @MainActor
+    func goingOfflineShowsBanner() async throws {
+        let monitor = MockNetworkMonitor()
+        let vm = ConnectivityViewModel(monitor: monitor)
+        vm.send(.startMonitoring)
+        monitor.emit(.disconnected)
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(vm.state.isBannerVisible)
+        #expect(vm.state.wasOffline)
+    }
+
+    @Test @MainActor
+    func reconnectingHidesBanner() async throws {
+        let monitor = MockNetworkMonitor()
+        let vm = ConnectivityViewModel(monitor: monitor)
+        vm.send(.startMonitoring)
+        monitor.emit(.disconnected)
+        try await Task.sleep(for: .milliseconds(10))
+        monitor.emit(.connected(.wifi))
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(!vm.state.isBannerVisible)
+    }
+
+    @Test @MainActor
+    func dismissBannerHidesItManually() async throws {
+        let monitor = MockNetworkMonitor()
+        let vm = ConnectivityViewModel(monitor: monitor)
+        vm.send(.startMonitoring)
+        monitor.emit(.disconnected)
+        try await Task.sleep(for: .milliseconds(10))
+        vm.send(.dismissBanner)
+        #expect(!vm.state.isBannerVisible)
+    }
+
+    @Test @MainActor
+    func isExpensiveOnCellular() async throws {
+        let monitor = MockNetworkMonitor()
+        let vm = ConnectivityViewModel(monitor: monitor)
+        vm.send(.startMonitoring)
+        monitor.emit(.connected(.cellular))
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(vm.state.isExpensive)
+        #expect(!vm.state.isOnWifi)
     }
 }
 ```

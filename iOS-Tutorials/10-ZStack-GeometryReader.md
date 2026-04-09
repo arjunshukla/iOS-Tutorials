@@ -369,8 +369,162 @@ struct RadialMenu: View {
 
 ---
 
+## MVVM Integration: `send(_:)` for overlay and tooltip state
+
+Overlay visibility, tooltip anchors, and card selections are state — they belong in the ViewModel:
+
+```swift
+// OverlayViewModel.swift
+import Observation
+import SwiftUI
+
+enum OverlayAction: Sendable {
+    case showTooltip(anchor: CGPoint, message: String)
+    case hideTooltip
+    case selectCard(id: UUID)
+    case dismissCard
+    case setParallaxOffset(CGFloat)
+}
+
+struct OverlayState: Equatable {
+    struct TooltipInfo: Equatable {
+        var anchor: CGPoint
+        var message: String
+    }
+    var tooltip: TooltipInfo?           = nil
+    var selectedCardID: UUID?           = nil
+    var parallaxOffset: CGFloat         = 0
+    var isTooltipVisible: Bool          { tooltip != nil }
+}
+
+@MainActor
+@Observable
+final class OverlayViewModel {
+    private(set) var state = OverlayState()
+
+    func send(_ action: OverlayAction) {
+        switch action {
+        case .showTooltip(let anchor, let message):
+            withAnimation(.easeOut(duration: 0.2)) {
+                state.tooltip = OverlayState.TooltipInfo(anchor: anchor, message: message)
+            }
+        case .hideTooltip:
+            withAnimation(.easeIn(duration: 0.15)) { state.tooltip = nil }
+        case .selectCard(let id):
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+                state.selectedCardID = id
+            }
+        case .dismissCard:
+            withAnimation(.spring) { state.selectedCardID = nil }
+        case .setParallaxOffset(let offset):
+            // No animation — drives a continuous scroll effect
+            state.parallaxOffset = offset
+        }
+    }
+}
+
+// TooltipView.swift — modular, pure display
+struct TooltipView: View {
+    let info: OverlayState.TooltipInfo
+
+    var body: some View {
+        Text(info.message)
+            .font(.caption)
+            .padding(8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .shadow(radius: 4)
+            .position(info.anchor)
+            .transition(.scale(scale: 0.8).combined(with: .opacity))
+    }
+}
+
+// CardDetailOverlay.swift — modular expanded card
+struct CardDetailOverlay: View {
+    let cardID: UUID
+    let onDismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.4)
+                .ignoresSafeArea()
+                .onTapGesture(perform: onDismiss)
+
+            RoundedRectangle(cornerRadius: 20)
+                .fill(.regularMaterial)
+                .frame(width: 300, height: 400)
+                .overlay(
+                    Button("Close", action: onDismiss)
+                        .padding()
+                    , alignment: .topTrailing
+                )
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    }
+}
+
+// MARK: — Swift Testing
+
+import Testing
+@testable import OverlayKit
+
+@Suite("OverlayViewModel")
+struct OverlayViewModelTests {
+
+    @Test @MainActor
+    func initialStateHasNoOverlays() {
+        let vm = OverlayViewModel()
+        #expect(!vm.state.isTooltipVisible)
+        #expect(vm.state.selectedCardID == nil)
+        #expect(vm.state.parallaxOffset == 0)
+    }
+
+    @Test @MainActor
+    func showTooltipSetsInfo() {
+        let vm = OverlayViewModel()
+        vm.send(.showTooltip(anchor: CGPoint(x: 100, y: 200), message: "Hello"))
+        #expect(vm.state.isTooltipVisible)
+        #expect(vm.state.tooltip?.message == "Hello")
+    }
+
+    @Test @MainActor
+    func hideTooltipClearsInfo() {
+        let vm = OverlayViewModel()
+        vm.send(.showTooltip(anchor: .zero, message: "Test"))
+        vm.send(.hideTooltip)
+        #expect(!vm.state.isTooltipVisible)
+        #expect(vm.state.tooltip == nil)
+    }
+
+    @Test @MainActor
+    func selectCardSetsID() {
+        let vm = OverlayViewModel()
+        let id = UUID()
+        vm.send(.selectCard(id: id))
+        #expect(vm.state.selectedCardID == id)
+    }
+
+    @Test @MainActor
+    func dismissCardClearsSelection() {
+        let vm = OverlayViewModel()
+        vm.send(.selectCard(id: UUID()))
+        vm.send(.dismissCard)
+        #expect(vm.state.selectedCardID == nil)
+    }
+
+    @Test @MainActor
+    func setParallaxOffsetUpdatesState() {
+        let vm = OverlayViewModel()
+        vm.send(.setParallaxOffset(42.5))
+        #expect(vm.state.parallaxOffset == 42.5)
+    }
+}
+```
+
+---
+
 ## Follow-up questions
 
 - *What's the difference between `.overlay` and `ZStack`?* (ZStack participates in layout sizing; overlay uses base view's size)
 - *How do you avoid GeometryReader breaking your layout?* (`.background`, `.overlay`, or contain it in a `.frame`)
 - *What's `ViewThatFits`?* (Tries each child in order and uses the first one that fits the available space — like CSS `min-content`)
+- *Why keep tooltip anchor position in the ViewModel?* (It can be tested without rendering. In a real app it would come from a tap gesture location — the VM is notified, not the view. This also lets you debounce rapid tooltip changes in the VM, not the View.)

@@ -364,8 +364,230 @@ struct VideoPlayerView: UIViewControllerRepresentable {
 
 ---
 
+## MVVM Integration: Shared ViewModel across UIKit and SwiftUI
+
+The critical insight for interop: **`@Observable` ViewModels work identically in both UIKit and SwiftUI.** The ViewModel has zero framework coupling.
+
+```swift
+// SharedViewModel.swift — works in UIKit and SwiftUI with zero changes
+import Observation
+
+enum InteropAction: Sendable {
+    case updateText(String)
+    case submitForm
+    case clearForm
+    case selectColor(UIColor)
+}
+
+struct InteropState: Equatable {
+    var text: String         = ""
+    var isSubmitted: Bool    = false
+    var selectedColor: UIColor = .systemBlue
+    var validationError: String? = nil
+
+    var canSubmit: Bool { !text.trimmingCharacters(in: .whitespaces).isEmpty && !isSubmitted }
+}
+
+@MainActor
+@Observable
+final class InteropViewModel {
+    private(set) var state = InteropState()
+
+    func send(_ action: InteropAction) {
+        switch action {
+        case .updateText(let t):
+            state.text = t
+            state.validationError = t.count < 3 && !t.isEmpty ? "Minimum 3 characters" : nil
+        case .submitForm:
+            guard state.canSubmit else { return }
+            state.isSubmitted = true
+        case .clearForm:
+            state = InteropState()
+        case .selectColor(let color):
+            state.selectedColor = color
+        }
+    }
+}
+
+// UIKit side — observes @Observable via withObservationTracking
+class InteropViewController: UIViewController {
+    private let vm = InteropViewModel()
+    private var observationTask: Task<Void, Never>?
+
+    private let textField = UITextField()
+    private let submitButton = UIButton(type: .system)
+    private let statusLabel = UILabel()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupUI()
+        bindToViewModel()
+    }
+
+    private func bindToViewModel() {
+        // ★ Swift 6 way to observe @Observable from UIKit
+        observationTask = Task { @MainActor in
+            while !Task.isCancelled {
+                withObservationTracking {
+                    // Read state — observation registers dependencies
+                    self.submitButton.isEnabled = self.vm.state.canSubmit
+                    self.statusLabel.text = self.vm.state.isSubmitted ? "Submitted!" : ""
+                    if let error = self.vm.state.validationError {
+                        self.statusLabel.text = error
+                        self.statusLabel.textColor = .systemRed
+                    }
+                } onChange: {
+                    // Called when any accessed property changes
+                    Task { @MainActor in self.bindToViewModel() }
+                }
+                break   // withObservationTracking registers once; loop re-registers
+            }
+        }
+    }
+
+    @objc private func textChanged() {
+        vm.send(.updateText(textField.text ?? ""))
+    }
+
+    @objc private func submitTapped() {
+        vm.send(.submitForm)
+    }
+
+    private func setupUI() {
+        view.backgroundColor = .systemBackground
+        textField.borderStyle = .roundedRect
+        textField.placeholder = "Enter text (min 3 chars)"
+        textField.addTarget(self, action: #selector(textChanged), for: .editingChanged)
+
+        submitButton.setTitle("Submit", for: .normal)
+        submitButton.addTarget(self, action: #selector(submitTapped), for: .touchUpInside)
+
+        let stack = UIStackView(arrangedSubviews: [textField, submitButton, statusLabel])
+        stack.axis = .vertical; stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            stack.widthAnchor.constraint(equalToConstant: 280)
+        ])
+    }
+
+    deinit { observationTask?.cancel() }
+}
+
+// SwiftUI side — same ViewModel, plain @State
+// InteropFormView.swift
+import SwiftUI
+
+struct InteropFormView: View {
+    @State private var vm = InteropViewModel()
+
+    var body: some View {
+        Form {
+            Section("Input") {
+                TextField("Enter text (min 3 chars)", text: Binding(
+                    get: { vm.state.text },
+                    set: { vm.send(.updateText($0)) }
+                ))
+                if let error = vm.state.validationError {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            }
+
+            Section {
+                Button("Submit") { vm.send(.submitForm) }
+                    .disabled(!vm.state.canSubmit)
+
+                if vm.state.isSubmitted {
+                    Label("Submitted!", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+            }
+
+            Section {
+                Button("Clear", role: .destructive) { vm.send(.clearForm) }
+            }
+        }
+        .navigationTitle("Interop Form")
+    }
+}
+
+// MARK: — Swift Testing
+// ★ One test suite covers both UIKit and SwiftUI behaviour — VM is framework-agnostic
+
+import Testing
+@testable import InteropKit
+
+@Suite("InteropViewModel")
+struct InteropViewModelTests {
+
+    @Test @MainActor
+    func initialStateIsEmpty() {
+        let vm = InteropViewModel()
+        #expect(vm.state.text.isEmpty)
+        #expect(!vm.state.isSubmitted)
+        #expect(!vm.state.canSubmit)
+    }
+
+    @Test @MainActor
+    func shortTextShowsValidationError() {
+        let vm = InteropViewModel()
+        vm.send(.updateText("ab"))
+        #expect(vm.state.validationError != nil)
+        #expect(!vm.state.canSubmit)
+    }
+
+    @Test @MainActor
+    func validTextClearsValidationError() {
+        let vm = InteropViewModel()
+        vm.send(.updateText("hello"))
+        #expect(vm.state.validationError == nil)
+        #expect(vm.state.canSubmit)
+    }
+
+    @Test @MainActor
+    func submitValidFormSetsSubmitted() {
+        let vm = InteropViewModel()
+        vm.send(.updateText("hello"))
+        vm.send(.submitForm)
+        #expect(vm.state.isSubmitted)
+        #expect(!vm.state.canSubmit)  // already submitted — disabled
+    }
+
+    @Test @MainActor
+    func submitInvalidFormIsNoop() {
+        let vm = InteropViewModel()
+        vm.send(.submitForm)  // text is empty
+        #expect(!vm.state.isSubmitted)
+    }
+
+    @Test @MainActor
+    func clearFormResetsAllState() {
+        let vm = InteropViewModel()
+        vm.send(.updateText("hello"))
+        vm.send(.submitForm)
+        vm.send(.clearForm)
+        #expect(vm.state == InteropState())
+    }
+
+    @Test @MainActor
+    func emptyTextHasNoValidationError() {
+        let vm = InteropViewModel()
+        vm.send(.updateText(""))   // empty is not an error, just not submittable
+        #expect(vm.state.validationError == nil)
+        #expect(!vm.state.canSubmit)
+    }
+}
+```
+
+**The architecture insight for Staff interviews:** The ViewModel has no `import SwiftUI` or `import UIKit`. Both frameworks talk to the same ViewModel via `send(_:)`. The single test suite covers behaviour for both surfaces. This is the correct layering — swap one rendering layer for another without touching business logic.
+
+---
+
 ## Follow-up questions
 
 - *What happens if you forget to call `didMove(toParent:)` on a UIHostingController?* (The child VC's lifecycle methods don't fire; SwiftUI `.task` and `.onAppear` may misbehave)
 - *How do you handle size changes in `UIViewRepresentable`?* (Implement `sizeThatFits(_:uiView:context:)` to participate in SwiftUI's layout)
 - *What's the performance cost of UIHostingController?* (Moderate — each one has its own SwiftUI render tree; don't use one per cell in a large list)
+- *Why use `withObservationTracking` in UIKit instead of Combine?* (It's the native observation system for `@Observable` — no KVO bridge, no `@Published`, no retain cycle risks with `AnyCancellable`)

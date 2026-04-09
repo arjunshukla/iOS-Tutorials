@@ -373,8 +373,132 @@ Build a **hero image transition** between a grid of thumbnails and a full-screen
 
 ---
 
+## MVVM Integration: `send(_:)` for animations
+
+Animation state follows the same send pattern. The key insight: **animate in `send`, not in the View**.
+
+```swift
+// AnimationViewModel.swift
+import Observation
+import SwiftUI
+
+enum AnimationAction: Sendable {
+    case toggleExpand
+    case triggerBounce
+    case selectCard(id: UUID)
+    case reset
+}
+
+struct AnimationState: Equatable {
+    var isExpanded: Bool     = false
+    var isBouncing: Bool     = false
+    var selectedCardID: UUID? = nil
+    var scale: Double        = 1.0
+}
+
+@MainActor
+@Observable
+final class AnimationViewModel {
+    private(set) var state = AnimationState()
+
+    func send(_ action: AnimationAction) {
+        switch action {
+        case .toggleExpand:
+            // ★ Animate the state change here, not in the View
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                state.isExpanded.toggle()
+            }
+        case .triggerBounce:
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.5)) {
+                state.scale = 1.3
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                withAnimation(.spring) { self?.state.scale = 1.0 }
+            }
+        case .selectCard(let id):
+            withAnimation(.easeInOut(duration: 0.3)) {
+                state.selectedCardID = (state.selectedCardID == id) ? nil : id
+            }
+        case .reset:
+            withAnimation { state = AnimationState() }
+        }
+    }
+}
+
+// Modular view — no animation logic, just displays state
+struct AnimatedCardView: View {
+    let cardID: UUID
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 16)
+            .fill(isSelected ? Color.accentColor : Color(.systemGray5))
+            .frame(width: isSelected ? 300 : 160, height: isSelected ? 200 : 100)
+            .onTapGesture(perform: onTap)
+    }
+}
+
+// MARK: — Swift Testing
+
+import Testing
+@testable import AnimationKit
+
+@Suite("AnimationViewModel")
+struct AnimationViewModelTests {
+
+    @Test @MainActor
+    func initialStateIsDefault() {
+        let vm = AnimationViewModel()
+        #expect(!vm.state.isExpanded)
+        #expect(!vm.state.isBouncing)
+        #expect(vm.state.selectedCardID == nil)
+    }
+
+    @Test @MainActor
+    func toggleExpandFlipsState() {
+        let vm = AnimationViewModel()
+        vm.send(.toggleExpand)
+        #expect(vm.state.isExpanded)
+        vm.send(.toggleExpand)
+        #expect(!vm.state.isExpanded)
+    }
+
+    @Test @MainActor
+    func selectCardSetsSelection() {
+        let vm = AnimationViewModel()
+        let id = UUID()
+        vm.send(.selectCard(id: id))
+        #expect(vm.state.selectedCardID == id)
+    }
+
+    @Test @MainActor
+    func selectSameCardDeselects() {
+        let vm = AnimationViewModel()
+        let id = UUID()
+        vm.send(.selectCard(id: id))
+        vm.send(.selectCard(id: id))  // tap same card again
+        #expect(vm.state.selectedCardID == nil)
+    }
+
+    @Test @MainActor
+    func resetRestoresDefaultState() {
+        let vm = AnimationViewModel()
+        vm.send(.toggleExpand)
+        vm.send(.selectCard(id: UUID()))
+        vm.send(.reset)
+        #expect(vm.state == AnimationState())
+    }
+}
+```
+
+**Testability note:** Animation state transitions (`isExpanded`, `selectedCardID`) are fully testable without the UI running. The `withAnimation` call is transparent to the test — only the final state value matters.
+
+---
+
 ## Follow-up questions
 
 - *What's the difference between `.animation(.spring, value:)` and `withAnimation(.spring) {}`?* (Former is implicit — applies to the specific value change; latter is explicit — applies to all state mutations inside the block)
 - *How do you animate between two different view types?* (`AnyTransition.asymmetric` or `matchedGeometryEffect`)
 - *What is `GeometryEffect`?* (A way to animate view transforms imperatively — more powerful than built-in modifiers but rarely needed)
+- *How do you test that an animation fires?* (Test the state change, not the animation — `#expect(vm.state.isExpanded)`. Visual regression testing requires snapshot tests with `swift-snapshot-testing`)

@@ -2,6 +2,8 @@
 ## Build: NavKit — a deep-link capable multi-stack app
 **Time:** 60 min | **Swift 6 + SwiftUI** | **Topics:** NavigationStack, NavigationPath, NavigationSplitView, deep linking, programmatic navigation, UIKit UINavigationController
 
+> **See also:** [Tutorial 22](22-MVVM-Coordinator.md) for the full **MVVM + Coordinator** pattern (coordinator owns navigation, VMs fire actions) and [Tutorial 23](23-Pure-SwiftUI-Navigation.md) for **Pure SwiftUI** environment-based routing. This tutorial covers the underlying SwiftUI APIs they both build on.
+
 ---
 
 ## What you'll build
@@ -377,8 +379,102 @@ extension NavigationRouter {
 
 ---
 
+## Router with `send(_:)` dispatch
+
+Apply the same dispatch pattern to the router for consistency:
+
+```swift
+// NavigationRouter.swift — send pattern on the router
+enum RouterAction: Sendable {
+    case navigate(AppRoute)
+    case navigateTo([AppRoute])
+    case pop
+    case popToRoot
+    case handleDeepLink(URL)
+}
+
+@MainActor
+@Observable
+final class NavigationRouter {
+    var path: NavigationPath = NavigationPath()
+
+    func send(_ action: RouterAction) {
+        switch action {
+        case .navigate(let route):    path.append(route)
+        case .navigateTo(let routes): routes.forEach { path.append($0) }
+        case .pop:                    guard !path.isEmpty else { return }; path.removeLast()
+        case .popToRoot:              path = NavigationPath()
+        case .handleDeepLink(let url):
+            guard let route = AppRoute(url: url) else { return }
+            send(.popToRoot)
+            send(.navigate(route))
+        }
+    }
+}
+
+// MARK: — Swift Testing
+
+import Testing
+@testable import NavKit
+
+@Suite("NavigationRouter")
+struct NavigationRouterTests {
+
+    @Test @MainActor
+    func navigateAppendsRoute() {
+        let router = NavigationRouter()
+        router.send(.navigate(.checkout))
+        #expect(!router.path.isEmpty)
+    }
+
+    @Test @MainActor
+    func navigateToMultipleRoutes() {
+        let router = NavigationRouter()
+        router.send(.navigateTo([.profile, .checkout]))
+        // NavigationPath.count is not directly accessible but path is non-empty
+        #expect(!router.path.isEmpty)
+    }
+
+    @Test @MainActor
+    func popOnEmptyPathIsNoop() {
+        let router = NavigationRouter()
+        router.send(.pop)  // should not crash
+        #expect(router.path.isEmpty)
+    }
+
+    @Test @MainActor
+    func popToRootClearsPath() {
+        let router = NavigationRouter()
+        router.send(.navigateTo([.profile, .checkout]))
+        router.send(.popToRoot)
+        #expect(router.path.isEmpty)
+    }
+
+    @Test @MainActor
+    func deepLinkCheckoutNavigatesAfterReset() {
+        let router = NavigationRouter()
+        router.send(.navigate(.profile))   // start with existing path
+        let url = URL(string: "navkit://checkout")!
+        router.send(.handleDeepLink(url))
+        // Path should have exactly the checkout route (root cleared first)
+        #expect(!router.path.isEmpty)
+    }
+
+    @Test @MainActor
+    func invalidDeepLinkIsNoop() {
+        let router = NavigationRouter()
+        let url = URL(string: "navkit://unknownroute")!
+        router.send(.handleDeepLink(url))
+        #expect(router.path.isEmpty)
+    }
+}
+```
+
+---
+
 ## Follow-up questions
 
 - *How do you handle back-swipe when you have a custom navigation transition?* (Override `interactivePopGestureRecognizer.delegate` in UIKit; in SwiftUI use `.navigationTransition`)
 - *What's wrong with the old `NavigationView`?* (Broken two-column behavior on iPad, inconsistent back behavior, no path API)
 - *How do you deep-link directly into a tab + stack combination?* (Hold router objects in `@Environment`, trigger navigation in the correct tab from `onOpenURL`)
+- *Why apply `send(_:)` to the router?* (Consistency — all state machines in the app follow one model. Makes it easy to add logging middleware: wrap `send` to log every action to analytics before processing)

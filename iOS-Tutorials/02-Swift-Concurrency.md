@@ -204,151 +204,317 @@ final class NewsService: Sendable {
 
 ---
 
-## Step 4 — ViewModel wiring structured cancellation (~10 min)
+## Step 4 — State struct + ViewModel with `send(_:)` (~10 min)
 
 ```swift
 // NewsViewModel.swift
 import Observation
 
-@MainActor
-@Observable
-final class NewsViewModel {
+// ★ All user intents modeled as an enum
+enum NewsAction: Sendable {
+    case refresh
+    case cancelFetch
+    case selectArticle(NewsArticle)    // fires coordinator action
+}
 
+// ★ All view state in one Equatable struct
+struct NewsState: Equatable {
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case loaded
+        case failed(String)
+    }
+    var phase: Phase = .idle
     var articles: [NewsArticle] = []
     var sourceStatuses: [String: SourceStatus] = [:]
-    var isLoading = false
-    var error: String?
+    var partialError: String? = nil    // some sources failed but others loaded
+}
 
-    private let service = NewsService()
-    private var fetchTask: Task<Void, Never>?  // hold reference for cancellation
+@MainActor
+protocol NewsViewModelProtocol: AnyObject {
+    var state: NewsState { get }
+    func send(_ action: NewsAction)
+}
 
-    func refresh() {
-        // Cancel any in-flight fetch before starting a new one
+@MainActor
+@Observable
+final class NewsViewModel: NewsViewModelProtocol {
+
+    private(set) var state = NewsState()
+    var onArticleSelected: ((NewsArticle) -> Void)?   // coordinator integration
+
+    private let service: any NewsServiceProtocol
+    private var fetchTask: Task<Void, Never>?
+
+    init(service: any NewsServiceProtocol = NewsService()) {
+        self.service = service
+    }
+
+    // ★ Single dispatch point
+    func send(_ action: NewsAction) {
+        switch action {
+        case .refresh:                   refresh()
+        case .cancelFetch:               cancelFetch()
+        case .selectArticle(let article): onArticleSelected?(article)
+        }
+    }
+
+    // MARK: - Private handlers
+
+    private func refresh() {
         fetchTask?.cancel()
 
-        isLoading = true
-        error = nil
+        state.phase = .loading
+        state.partialError = nil
 
-        // Mark all sources as loading
         for source in NewsService.sources {
-            sourceStatuses[source.name] = .loading
+            state.sourceStatuses[source.name] = .loading
         }
 
         fetchTask = Task {
             let results = await service.fetchAll()
-
-            guard !Task.isCancelled else { return }  // ★ always check
+            guard !Task.isCancelled else { return }
 
             var allArticles: [NewsArticle] = []
+            var hadFailure = false
 
             for (name, result) in results {
                 switch result {
                 case .success(let fetched):
-                    sourceStatuses[name] = .loaded(fetched.count)
+                    state.sourceStatuses[name] = .loaded(fetched.count)
                     allArticles.append(contentsOf: fetched)
-                case .failure(let err):
-                    sourceStatuses[name] = .failed(err.localizedDescription)
-                    self.error = "Some sources failed to load"
+                case .failure:
+                    state.sourceStatuses[name] = .failed("Failed")
+                    hadFailure = true
                 }
             }
 
-            articles = allArticles.sorted { $0.publishedAt > $1.publishedAt }
-            isLoading = false
+            state.articles = allArticles.sorted { $0.publishedAt > $1.publishedAt }
+            state.partialError = hadFailure ? "Some sources failed to load" : nil
+            state.phase = .loaded
         }
     }
 
-    func cancelFetch() {
+    private func cancelFetch() {
         fetchTask?.cancel()
-        isLoading = false
+        state.phase = state.articles.isEmpty ? .idle : .loaded
     }
+}
 
-    // Demonstrate async let
-    func prefetchFirst() async {
-        async let a = service.fetchAll()
-        // Do other work here while fetching…
-        let results = await a
-        print("Prefetched \(results.count) sources")
+// NewsServiceProtocol — injectable for testing
+protocol NewsServiceProtocol: Sendable {
+    func fetchAll() async -> [String: Result<[NewsArticle], FetchError>]
+}
+
+extension NewsService: NewsServiceProtocol {}
+```
+
+---
+
+## Step 5 — Modular views (~10 min)
+
+```swift
+// SourceStatusBadge.swift
+import SwiftUI
+
+struct SourceStatusBadge: View {
+    let status: SourceStatus
+
+    var body: some View {
+        switch status {
+        case .idle:           Text("—").foregroundStyle(.tertiary)
+        case .loading:        ProgressView().scaleEffect(0.7)
+        case .loaded(let n):  Text("\(n)").foregroundStyle(.green)
+        case .failed(let e):  Image(systemName: "exclamationmark.triangle")
+                                  .foregroundStyle(.red).help(e)
+        }
+    }
+}
+
+// SourceStatusSection.swift
+struct SourceStatusSection: View {
+    let statuses: [String: SourceStatus]
+    let sources: [NewsSource]
+
+    var body: some View {
+        Section("Sources") {
+            ForEach(sources, id: \.name) { source in
+                HStack {
+                    Text(source.name)
+                    Spacer()
+                    SourceStatusBadge(status: statuses[source.name] ?? .idle)
+                }
+            }
+        }
+    }
+}
+
+// ArticleRow.swift
+struct ArticleRow: View {
+    let article: NewsArticle
+    let onSelect: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(article.title).font(.headline)
+            HStack {
+                Text(article.source).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(article.publishedAt, style: .relative).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+    }
+}
+
+// ArticlesSection.swift
+struct ArticlesSection: View {
+    let articles: [NewsArticle]
+    let isLoading: Bool
+    let onSelect: (NewsArticle) -> Void
+
+    var body: some View {
+        Section("Articles (\(articles.count))") {
+            if articles.isEmpty && !isLoading {
+                Text("Pull to refresh").foregroundStyle(.secondary)
+            }
+            ForEach(articles) { article in
+                ArticleRow(article: article, onSelect: { onSelect(article) })
+            }
+        }
+    }
+}
+
+// NewsView.swift — root view
+struct NewsView: View {
+    @State private var vm = NewsViewModel()
+
+    var body: some View {
+        NavigationStack {
+            List {
+                SourceStatusSection(
+                    statuses: vm.state.sourceStatuses,
+                    sources: NewsService.sources
+                )
+                ArticlesSection(
+                    articles: vm.state.articles,
+                    isLoading: vm.state.phase == .loading,
+                    onSelect: { vm.send(.selectArticle($0)) }
+                )
+            }
+            .navigationTitle("News")
+            .refreshable { vm.send(.refresh) }
+            .toolbar {
+                if vm.state.phase == .loading {
+                    ToolbarItem {
+                        Button("Cancel") { vm.send(.cancelFetch) }
+                    }
+                }
+            }
+            .overlay {
+                if vm.state.phase == .loading && vm.state.articles.isEmpty {
+                    ProgressView("Fetching \(NewsService.sources.count) sources…")
+                }
+            }
+        }
+        .task { vm.send(.refresh) }   // ★ .task auto-cancels on view disappear
     }
 }
 ```
 
 ---
 
-## Step 5 — SwiftUI view (~10 min)
+## Swift Testing suite
 
 ```swift
-// ContentView.swift
-import SwiftUI
+// NewsViewModelTests.swift
+import Testing
+@testable import ParallelFetch
 
-struct ContentView: View {
-    @State private var vm = NewsViewModel()
+// Deterministic mock service
+struct MockNewsService: NewsServiceProtocol {
+    let results: [String: Result<[NewsArticle], FetchError>]
 
-    var body: some View {
-        NavigationStack {
-            List {
-                // Source status header
-                Section("Sources") {
-                    ForEach(NewsService.sources, id: \.name) { source in
-                        HStack {
-                            Text(source.name)
-                            Spacer()
-                            statusBadge(vm.sourceStatuses[source.name] ?? .idle)
-                        }
-                    }
-                }
+    func fetchAll() async -> [String: Result<[NewsArticle], FetchError>] { results }
+}
 
-                // Articles
-                Section("Articles (\(vm.articles.count))") {
-                    if vm.articles.isEmpty && !vm.isLoading {
-                        Text("Pull to refresh")
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(vm.articles) { article in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(article.title)
-                                .font(.headline)
-                            HStack {
-                                Text(article.source)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(article.publishedAt, style: .relative)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-            }
-            .navigationTitle("News")
-            .refreshable { vm.refresh() }
-            .toolbar {
-                if vm.isLoading {
-                    ToolbarItem {
-                        Button("Cancel") { vm.cancelFetch() }
-                    }
-                }
-            }
-            .overlay {
-                if vm.isLoading && vm.articles.isEmpty {
-                    ProgressView("Fetching \(NewsService.sources.count) sources…")
-                }
-            }
-        }
-        .task { vm.refresh() }   // ★ .task cancels automatically on view disappear
+@Suite("NewsViewModel")
+struct NewsViewModelTests {
+
+    private func article(source: String) -> NewsArticle {
+        NewsArticle(
+            id: UUID(),
+            source: source,
+            title: "Test: \(source)",
+            publishedAt: .now,
+            url: URL(string: "https://example.com")!
+        )
     }
 
-    @ViewBuilder
-    func statusBadge(_ status: SourceStatus) -> some View {
-        switch status {
-        case .idle:           Text("—").foregroundStyle(.tertiary)
-        case .loading:        ProgressView().scaleEffect(0.7)
-        case .loaded(let n):  Text("\(n)").foregroundStyle(.green)
-        case .failed(let e):  Image(systemName: "exclamationmark.triangle")
-                                  .foregroundStyle(.red)
-                                  .help(e)
-        }
+    @Test @MainActor
+    func initialPhaseIsIdle() {
+        let vm = NewsViewModel(service: MockNewsService(results: [:]))
+        #expect(vm.state.phase == .idle)
+    }
+
+    @Test @MainActor
+    func refreshSetsLoadingPhase() {
+        let vm = NewsViewModel(service: MockNewsService(results: [:]))
+        vm.send(.refresh)
+        #expect(vm.state.phase == .loading)
+    }
+
+    @Test @MainActor
+    func refreshWithSuccessTransitionsToLoaded() async throws {
+        let a = article(source: "TechCrunch")
+        let service = MockNewsService(results: ["TechCrunch": .success([a])])
+        let vm = NewsViewModel(service: service)
+
+        vm.send(.refresh)
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(vm.state.phase == .loaded)
+        #expect(vm.state.articles.count == 1)
+    }
+
+    @Test @MainActor
+    func refreshWithAllFailuresShowsPartialError() async throws {
+        let service = MockNewsService(results: [
+            "TechCrunch": .failure(.networkError("TC", underlying: URLError(.notConnectedToInternet)))
+        ])
+        let vm = NewsViewModel(service: service)
+
+        vm.send(.refresh)
+        try await Task.sleep(for: .milliseconds(10))
+
+        #expect(vm.state.partialError != nil)
+    }
+
+    @Test @MainActor
+    func cancelFetchTransitionsToIdleWhenNoArticles() async throws {
+        let vm = NewsViewModel(service: MockNewsService(results: [:]))
+        vm.send(.refresh)
+        vm.send(.cancelFetch)
+        #expect(vm.state.phase == .idle)
+    }
+
+    @Test @MainActor
+    func selectArticleFiresCallback() async throws {
+        let a = article(source: "TechCrunch")
+        let service = MockNewsService(results: ["TechCrunch": .success([a])])
+        let vm = NewsViewModel(service: service)
+
+        var selectedArticle: NewsArticle?
+        vm.onArticleSelected = { selectedArticle = $0 }
+
+        vm.send(.refresh)
+        try await Task.sleep(for: .milliseconds(10))
+        vm.send(.selectArticle(a))
+
+        #expect(selectedArticle?.id == a.id)
     }
 }
 ```

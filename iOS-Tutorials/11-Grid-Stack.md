@@ -366,8 +366,255 @@ struct MasonryLayout: Layout {
 
 ---
 
+## MVVM Integration: `send(_:)` for layout state
+
+Layout selection and configuration should live in a ViewModel, not directly in the View:
+
+```swift
+// LayoutViewModel.swift
+import Observation
+import SwiftUI
+
+enum LayoutAction: Sendable {
+    case selectLayout(LayoutMode)
+    case updateColumnCount(Int)
+    case toggleSpacing
+    case selectItem(id: UUID)
+}
+
+enum LayoutMode: String, CaseIterable, Sendable {
+    case adaptive  = "Adaptive Grid"
+    case fixed     = "Fixed 3-Col"
+    case masonry   = "Masonry"
+    case list      = "List"
+}
+
+struct LayoutState: Equatable {
+    var mode: LayoutMode    = .adaptive
+    var columnCount: Int    = 3
+    var showSpacing: Bool   = true
+    var selectedItemID: UUID? = nil
+
+    var gridColumns: [GridItem] {
+        switch mode {
+        case .adaptive:
+            return [GridItem(.adaptive(minimum: 100), spacing: showSpacing ? 8 : 0)]
+        case .fixed:
+            return Array(repeating: GridItem(.flexible(), spacing: showSpacing ? 8 : 0), count: columnCount)
+        case .masonry, .list:
+            return [GridItem(.flexible())]
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class LayoutViewModel {
+    private(set) var state = LayoutState()
+
+    func send(_ action: LayoutAction) {
+        switch action {
+        case .selectLayout(let mode):
+            state.mode = mode
+            // Reset column count to sensible default for the new mode
+            if mode == .fixed { state.columnCount = 3 }
+        case .updateColumnCount(let n):
+            state.columnCount = max(1, min(6, n))
+        case .toggleSpacing:
+            state.showSpacing.toggle()
+        case .selectItem(let id):
+            state.selectedItemID = (state.selectedItemID == id) ? nil : id
+        }
+    }
+}
+
+// Modular views — each receives only what it needs
+
+// LayoutPickerView.swift
+struct LayoutPickerView: View {
+    let currentMode: LayoutMode
+    let onSelect: (LayoutMode) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(LayoutMode.allCases, id: \.self) { mode in
+                    Button(mode.rawValue) { onSelect(mode) }
+                        .buttonStyle(.bordered)
+                        .tint(mode == currentMode ? .accentColor : .secondary)
+                }
+            }
+            .padding(.horizontal)
+        }
+    }
+}
+
+// ColumnStepperView.swift
+struct ColumnStepperView: View {
+    let count: Int
+    let onChange: (Int) -> Void
+
+    var body: some View {
+        HStack {
+            Text("Columns: \(count)")
+            Stepper("", value: Binding(get: { count }, set: onChange), in: 1...6)
+                .labelsHidden()
+        }
+        .padding(.horizontal)
+    }
+}
+
+// GalleryItemView.swift
+struct GalleryItemView: View {
+    let id: UUID
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(isSelected ? Color.accentColor.opacity(0.3) : Color(.systemGray5))
+            .frame(height: 80)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.accentColor : .clear, lineWidth: 2)
+            )
+            .onTapGesture(perform: onSelect)
+    }
+}
+
+// LayoutLabView.swift — root view
+struct LayoutLabView: View {
+    @State private var vm = LayoutViewModel()
+    let items = (0..<30).map { _ in UUID() }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                LayoutPickerView(
+                    currentMode: vm.state.mode,
+                    onSelect: { vm.send(.selectLayout($0)) }
+                )
+                .padding(.vertical, 8)
+
+                if vm.state.mode == .fixed {
+                    ColumnStepperView(
+                        count: vm.state.columnCount,
+                        onChange: { vm.send(.updateColumnCount($0)) }
+                    )
+                    .padding(.bottom, 8)
+                }
+
+                ScrollView {
+                    LazyVGrid(columns: vm.state.gridColumns, spacing: vm.state.showSpacing ? 8 : 0) {
+                        ForEach(items, id: \.self) { id in
+                            GalleryItemView(
+                                id: id,
+                                isSelected: vm.state.selectedItemID == id,
+                                onSelect: { vm.send(.selectItem(id: id)) }
+                            )
+                        }
+                    }
+                    .padding(vm.state.showSpacing ? 8 : 0)
+                    .animation(.easeInOut(duration: 0.3), value: vm.state.gridColumns.count)
+                }
+            }
+            .navigationTitle("LayoutLab")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(vm.state.showSpacing ? "No Spacing" : "With Spacing") {
+                        vm.send(.toggleSpacing)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: — Swift Testing
+
+import Testing
+@testable import LayoutLab
+
+@Suite("LayoutViewModel")
+struct LayoutViewModelTests {
+
+    @Test @MainActor
+    func initialStateIsAdaptive() {
+        let vm = LayoutViewModel()
+        #expect(vm.state.mode == .adaptive)
+        #expect(vm.state.showSpacing)
+    }
+
+    @Test @MainActor
+    func selectLayoutChangesMode() {
+        let vm = LayoutViewModel()
+        vm.send(.selectLayout(.fixed))
+        #expect(vm.state.mode == .fixed)
+    }
+
+    @Test @MainActor
+    func switchingToFixedResetColumnCount() {
+        let vm = LayoutViewModel()
+        vm.send(.selectLayout(.fixed))
+        #expect(vm.state.columnCount == 3)
+    }
+
+    @Test @MainActor
+    func updateColumnCountClampedToRange() {
+        let vm = LayoutViewModel()
+        vm.send(.updateColumnCount(0))   // below minimum
+        #expect(vm.state.columnCount == 1)
+        vm.send(.updateColumnCount(99))  // above maximum
+        #expect(vm.state.columnCount == 6)
+    }
+
+    @Test @MainActor
+    func toggleSpacingFlipsFlag() {
+        let vm = LayoutViewModel()
+        let initial = vm.state.showSpacing
+        vm.send(.toggleSpacing)
+        #expect(vm.state.showSpacing == !initial)
+    }
+
+    @Test @MainActor
+    func selectItemSetsSelection() {
+        let vm = LayoutViewModel()
+        let id = UUID()
+        vm.send(.selectItem(id: id))
+        #expect(vm.state.selectedItemID == id)
+    }
+
+    @Test @MainActor
+    func tapSameItemDeselects() {
+        let vm = LayoutViewModel()
+        let id = UUID()
+        vm.send(.selectItem(id: id))
+        vm.send(.selectItem(id: id))
+        #expect(vm.state.selectedItemID == nil)
+    }
+
+    @Test @MainActor
+    func adaptiveModeProducesOneColumn() {
+        let vm = LayoutViewModel()
+        vm.send(.selectLayout(.adaptive))
+        #expect(vm.state.gridColumns.count == 1)
+    }
+
+    @Test @MainActor
+    func fixedModeProducesColumnCountColumns() {
+        let vm = LayoutViewModel()
+        vm.send(.selectLayout(.fixed))
+        vm.send(.updateColumnCount(4))
+        #expect(vm.state.gridColumns.count == 4)
+    }
+}
+```
+
+---
+
 ## Follow-up questions
 
 - *When would you use `List` instead of `LazyVStack`?* (List gives you swipe-to-delete, drag reordering, section headers — but less layout flexibility)
 - *What's the performance difference between `Grid` and nested `HStack/VStack`?* (Grid does a single layout pass with shared column widths; nested stacks do independent layout which misaligns columns)
 - *What's `ViewThatFits` and when would you use it?* (Tries views in order and uses first that fits — great for responsive text that falls back to smaller version)
+- *Why move grid column config into the ViewModel?* (Layout configuration is business logic — it needs to persist, be tested, and potentially be saved to `UserDefaults`. The View should just render what the ViewModel says.)
