@@ -156,10 +156,20 @@ final class PomodoroViewModel: PomodoroViewModelProtocol {
     private var elapsedAtPause: TimeInterval = 0
     private let clock: ClockServiceProtocol
 
-    // Coordinator integration — fires when session completes
-    var onAction: ((PomodoroAction) -> Void)?
+    // Coordinator integration — stored property must be in class body, not extension
+    enum CoordinatorEvent {
+        case didFinishSession(count: Int)
+    }
+    var onCoordinatorEvent: ((CoordinatorEvent) -> Void)?
 
-    init(clock: ClockServiceProtocol = SystemClock()) {
+    // ★ Two explicit inits instead of a default parameter expression.
+    // In Swift 6, default parameter expressions evaluate in a nonisolated context,
+    // which conflicts with @MainActor class inits.
+    init() {
+        self.clock = SystemClock()
+    }
+
+    init(clock: any ClockServiceProtocol) {
         self.clock = clock
     }
 
@@ -239,7 +249,7 @@ final class PomodoroViewModel: PomodoroViewModelProtocol {
         state.status = .finished
         elapsedAtPause = 0
         startedAt = nil
-        onAction?(.didFinishSession(count: state.completedSessions))
+        onCoordinatorEvent?(.didFinishSession(count: state.completedSessions))
     }
 
     // ★ Self-correcting: anchors to wall-clock, not tick count
@@ -262,21 +272,6 @@ final class PomodoroViewModel: PomodoroViewModelProtocol {
     }
 }
 
-// Separate coordinator-facing actions from timer actions
-// (keeps PomodoroAction lean and timer-only)
-extension PomodoroViewModel {
-    enum CoordinatorEvent {
-        case didFinishSession(count: Int)
-    }
-    var onCoordinatorEvent: ((CoordinatorEvent) -> Void)?
-}
-
-// Fix: use proper coordinator event
-private extension PomodoroViewModel {
-    func notifyCoordinator(count: Int) {
-        onCoordinatorEvent?(.didFinishSession(count: count))
-    }
-}
 ```
 
 ---
